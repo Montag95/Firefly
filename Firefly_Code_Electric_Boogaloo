@@ -1,0 +1,304 @@
+
+#include <msp430.h>
+
+
+unsigned char RX_Data[6];
+unsigned char TX_Data[2];
+unsigned char RX_ByteCtr;
+unsigned char TX_ByteCtr;
+
+
+int xAccel;//acceleration in x direction
+int yAccel;//acceleration in y direction
+int zAccel;//acceleration in z direction - normal to the sensor
+int xVel;//velocity in x
+double yVel;//velocity in y
+double zVel;//velocity in z
+double xPos;//position in x
+double yPos;//position in y
+double zPos;//position in z
+double zAccel_converted;//converted acceleration
+double lapse_rate;// dT/dz
+int xAngle;
+int yAngle;
+int zAngle;
+
+unsigned char slaveAddress = 0x68;	// Set slave address for MPU-6050
+					// 0x68 for ADD pin=0
+					// 0x69 for ADD pin=1
+
+const unsigned char PWR_MGMT_1   = 0x6B;	// MPU-6050 register address
+const unsigned char ACCEL_XOUT_H = 0x3B;	// MPU-6050 register address
+const unsigned char ACCEL_XOUT_L = 0x3C;	// MPU-6050 register address
+const unsigned char ACCEL_YOUT_H = 0x3D;	// MPU-6050 register address
+const unsigned char ACCEL_YOUT_L = 0x3E;	// MPU-6050 register address
+const unsigned char ACCEL_ZOUT_H = 0x3F;	// MPU-6050 register address
+const unsigned char ACCEL_ZOUT_L = 0x40;	// MPU-6050 register address
+const unsigned char ACCEL_CONFIG = 0x1C;    //MPU-6050 register address
+
+//functions for i2c initialization, reading, and writing
+void i2cInit(void);
+void i2cWrite(unsigned char);
+void i2cRead(unsigned char);
+
+
+//*********************************************************************************************
+//function to initialize ADC
+void tempInit()
+{
+    ADC10CTL0=SREF_1 + REFON + ADC10ON + ADC10SHT_3 ; //1.5V ref,Ref on,64 clocks for sample
+    ADC10CTL1=INCH_10+ ADC10DIV_3; //temp sensor is at 10 and clock/4
+}
+//*********************************************************************************************
+//compute and output approximate temperature
+double tempOut()
+{
+    int t=0;
+    __delay_cycles(1000);              //wait for reference to settle
+    ADC10CTL0 |= ENC + ADC10SC;      //enable conversion and start conversion
+    while(ADC10CTL1 & BUSY);         //convert
+    t=ADC10MEM;                       //store val in t
+    ADC10CTL0&=~ENC;                     //disable adc conv
+    return ((t * 27069L - 18169625L) >> 16); //convert and pass
+}
+//*********************************************************************************************
+void flash_erase(int *flash)
+{
+  _DINT();                             // Disable interrupts. This is important, otherwise,
+                                       // a flash operation in progress while interrupt may
+                                       // crash the system.
+  while(BUSY & FCTL3);                 // Check if Flash being used
+  FCTL2 = FWKEY + FSSEL_1 + FN3;       // Clk = SMCLK/4
+  FCTL1 = FWKEY + ERASE;               // Set Erase bit
+  FCTL3 = FWKEY;                       // Clear Lock bit
+  *flash = 0;                           // Dummy write to erase Flash segment
+  while(BUSY & FCTL3);                 // Check if Flash being used
+  FCTL1 = FWKEY;                       // Clear WRT bit
+  FCTL3 = FWKEY + LOCK;                // Set LOCK bit
+  _EINT();
+}
+void write_flash(int value, int*flash)
+{
+	while(FCTL3 & BUSY);
+	  FCTL3 = FWKEY;
+	  FCTL1 = FWKEY + WRT;
+	  *flash = value;
+	  FCTL1 = FWKEY;
+	  FCTL3 = FWKEY + LOCK;
+}
+unsigned int read_flash(int *flash)
+{
+	return *flash;
+}
+int main(void)
+{
+	volatile int temp;//assign temperature variable
+	WDTCTL = WDTPW + WDTHOLD; 				// stop watch dog timer
+
+	// Set clock speed (default = 1 MHz)
+	BCSCTL1 = CALBC1_1MHZ;	 				// Basic Clock System CTL (1,8,12 16_MHZ available)
+	DCOCTL  = CALDCO_1MHZ;	 				// Digitally-Controlled Oscillator CTL
+
+	P1DIR = BIT3 | BIT4 | BIT5;
+	P2DIR = BIT0 | BIT1;
+
+	P2OUT = BIT0;
+
+	// set up I2C pins
+	P1SEL |= BIT6 + BIT7;					// Assign I2C pins to USCI_B0
+	P1SEL2|= BIT6 + BIT7;					// Assign I2C pins to USCI_B1
+
+	// Initialize the I2C state machine
+	i2cInit();
+
+	P2OUT = 0;
+	P1OUT = BIT3;
+
+	// Wake up and initialize the MPU-6050
+	slaveAddress = 0x68;					// MPU-6050 address
+	TX_Data[1] = 0x6B;						// address of PWR_MGMT_1 register
+	TX_Data[0] = 0x00;						// set register to zero (wakes up the MPU-6050)
+	TX_ByteCtr = 2;
+	i2cWrite(slaveAddress);//write to the I2C pins
+
+	P1OUT = BIT4;
+	__delay_cycles(40000);
+
+	//Temperature Configurations
+	temp=0;
+	tempInit();//initialise adc
+
+	//placing the accelerometer in mode 3
+	//which is +/- 16g
+	TX_Data[1] = 0x1C;
+	TX_Data[0] = 0x18;
+	TX_ByteCtr = 2;
+	i2cWrite(slaveAddress);
+
+	int *flash = (int*)0xE000;
+	int* i = flash;
+	for(i; i < 0xFE00; i++)
+	{
+		flash_erase(i);
+	}
+	int boolean = 1;
+	int j = 0;
+
+
+	while (boolean==1)
+	{
+		P1OUT = 0;
+		P2OUT = BIT1;
+
+		__delay_cycles(100000);//ensures a 10 Hz sampling rate
+
+		P2OUT = BIT0 | BIT1;
+
+		// Point to the ACCEL_ZOUT_H register in the MPU-6050
+		slaveAddress = 0x68;					// MPU-6050 address
+		TX_Data[0] = 0x3B;					// register address
+		TX_ByteCtr = 1;
+		i2cWrite(slaveAddress);
+
+		// Read the two bytes of data and store them in zAccel
+		slaveAddress = 0x68;					// MPU-6050 address
+		RX_ByteCtr = 6;
+		i2cRead(slaveAddress);
+
+		//update the acceleration values
+		xAccel  = RX_Data[5] << 8;				// MSB
+		xAccel |= RX_Data[4];					// LSB
+		yAccel  = RX_Data[3] << 8;				// MSB
+		yAccel |= RX_Data[2];					// LSB
+		zAccel  = RX_Data[1] << 8;				// MSB
+		zAccel |= RX_Data[0];					// LSB
+
+		//acquiring the average temperature for more accuracy
+		int ii = 0;
+		for(ii = 0; ii<50; ++ii)
+		{
+			temp += tempOut();//update the temperature data
+		}
+		temp /= 50;
+
+		//P1OUT = BIT3 | BIT4 | BIT5;
+		__delay_cycles(40000);
+
+		//Storing to flash memory
+		if(abs(zAccel) > 2*2048)
+		{
+
+			write_flash(temp, flash+j);
+
+	    	P1OUT = 0;
+	    	P2OUT = BIT0;
+	    	__delay_cycles(40000);
+	    	P2OUT = 0;
+	    	P1OUT = BIT3;
+	    	__delay_cycles(40000);
+	    	P1OUT = BIT4;
+	    	__delay_cycles(40000);
+	    	P1OUT = BIT5;
+	    	__delay_cycles(40000);
+	    	P1OUT = 0;
+	    	P2OUT = BIT1;
+	    	__delay_cycles(40000);
+
+	    	P1OUT = 0;
+	    	P2OUT = 0;
+
+
+			if(*flash + j >= 0xFE00)
+			{
+				boolean = 0;
+			}
+			j++;
+		}
+
+
+		__no_operation();                       // Set breakpoint >>here<< and read in debug mode
+
+	}
+
+	for(;;){
+		P1OUT = BIT3 | BIT4 | BIT5;
+		P2OUT = BIT0 | BIT1;
+    	__delay_cycles(60000);
+	}
+}
+
+//*********************************************************************************************
+void i2cInit(void)
+{
+	// set up I2C module
+	UCB0CTL1 |= UCSWRST;				// Enable SW reset
+	UCB0CTL0 = UCMST + UCMODE_3 + UCSYNC;	        // I2C Master, synchronous mode
+	UCB0CTL1 = UCSSEL_2 + UCSWRST;			// Use SMCLK, keep SW reset
+	UCB0BR0 = 10;					// fSCL = SMCLK/12 = ~100kHz
+	UCB0BR1 = 0;
+	UCB0CTL1 &= ~UCSWRST;				// Clear SW reset, resume operation
+}
+
+//*********************************************************************************************
+//write to I2C pins - derived online
+void i2cWrite(unsigned char address)
+{
+	__disable_interrupt();
+	UCB0I2CSA = address;				// Load slave address
+	IE2 |= UCB0TXIE;				// Enable TX interrupt
+	while(UCB0CTL1 & UCTXSTP);			// Ensure stop condition sent
+	UCB0CTL1 |= UCTR + UCTXSTT;			// TX mode and START condition
+	__delay_cycles(10000);
+	//__bis_SR_register(CPUOFF + GIE);		// sleep until UCB0TXIFG is set ...
+}
+
+//*********************************************************************************************
+//read from I2C pins - derived online
+void i2cRead(unsigned char address)
+{
+	__disable_interrupt();
+	UCB0I2CSA = address;				// Load slave address
+	IE2 |= UCB0RXIE;				// Enable RX interrupt
+	while(UCB0CTL1 & UCTXSTP);			// Ensure stop condition sent
+	UCB0CTL1 &= ~UCTR;				// RX mode
+	UCB0CTL1 |= UCTXSTT;				// Start Condition
+	__delay_cycles(10000);
+	//__bis_SR_register(CPUOFF + GIE);		// sleep until UCB0RXIFG is set ...
+}
+
+/**********************************************************************************************/
+// USCIAB0TX_ISR
+#pragma vector = USCIAB0TX_VECTOR
+__interrupt void USCIAB0TX_ISR(void)
+{
+	if(UCB0CTL1 & UCTR)					// TX mode (UCTR == 1)
+	{
+		if (TX_ByteCtr)				        // TRUE if more bytes remain
+		{
+			TX_ByteCtr--;				// Decrement TX byte counter
+			UCB0TXBUF = TX_Data[TX_ByteCtr];	// Load TX buffer
+		}
+		else						// no more bytes to send
+		{
+			UCB0CTL1 |= UCTXSTP;			// I2C stop condition
+			IFG2 &= ~UCB0TXIFG;			// Clear USCI_B0 TX int flag
+			__bic_SR_register_on_exit(CPUOFF);	// Exit LPM0
+		}
+	}
+	else // (UCTR == 0)					// RX mode
+	{
+		RX_ByteCtr--;				        // Decrement RX byte counter
+		if (RX_ByteCtr)				        // RxByteCtr != 0
+		{
+			RX_Data[RX_ByteCtr] = UCB0RXBUF;	// Get received byte
+			if (RX_ByteCtr == 1)			// Only one byte left?
+			UCB0CTL1 |= UCTXSTP;			// Generate I2C stop condition
+		}
+		else						// RxByteCtr == 0
+		{
+			RX_Data[RX_ByteCtr] = UCB0RXBUF;	// Get final received byte
+			__bic_SR_register_on_exit(CPUOFF);	// Exit LPM0
+		}
+	}
+}
+// __DINT() is in IAR workbench
